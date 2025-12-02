@@ -425,27 +425,27 @@ private def updateOnTimeFromStatus(String newStatus) {
     displayDebugLog("updateOnTimeFromStatus: lastStatus=${lastStatus}, newStatus=${newStatus}, accumulated=${display}")
 }
 
-// Every minute: if switch is ON, advance the accumulated ON time by exactly 1 minute
+// Every minute: recompute total ON time from timestamps and push the current value
 def tickOnTimer() {
-    String lastStatus = (state.lastSwitchStatus ?: device.currentValue('switch') ?: 'off') as String
     long nowTs = now()
+    String lastStatus = (state.lastSwitchStatus ?: device.currentValue('switch') ?: 'off') as String
     long acc = (state.accumulatedOnMsToday ?: 0L) as long
+    long lastTs = (state.lastSwitchChangeTs ?: nowTs) as long
 
+    // Start from accumulated value in state
+    long totalMs = acc
+
+    // If currently ON, add the time since the last switch-change timestamp
     if (lastStatus == 'on') {
-        // Add exactly 60,000 ms per tick to avoid truncation issues
-        acc += 60000L
-        state.accumulatedOnMsToday = acc
-
-        def display = formatDurationHHMM(acc)
-        sendEvent(name: 'onTimeToday', value: display)
-        displayDebugLog("tickOnTimer: +1 minute (status=on), accumulated=${display}")
-    } else {
-        displayDebugLog("tickOnTimer: switch is off, no change")
+        totalMs += (nowTs - lastTs)
     }
 
-    // Keep lastSwitchChangeTs in sync so OFF calculation can add only the remaining partial minute
-    state.lastSwitchChangeTs = nowTs
+    // Just display; do NOT change accumulatedOnMsToday or lastSwitchChangeTs here
+    def display = formatDurationHHMM(totalMs)
+    sendEvent(name: 'onTimeToday', value: display)
+    displayDebugLog("tickOnTimer: status=${lastStatus}, displayed accumulated=${display}")
 }
+
 
 
 // Daily reset based on user preference HH:MM
