@@ -14,6 +14,9 @@
  *  1.1.1   -   Changes by Amithalp to deal with NULL values and some filtering of logs
  *  1.2.0   -   Add daily ON-time accumulator and human-readable lastCommunicationTime (DD/MM/YY HH:MM, timer HH:MM)
  *  1.2.1   -   Add 1-minute tick for ON timer and startup safeguard after hub reboot
+ *  1.2.2   -   Replace fixed +1-minute increments with accurate time recomputation to avoid missed-tick under-counting
+ *  1.2.3   -   Add PresenceSensor capability with presenceTimeout, automatic present/not present tracking based on last LAN communication
+
  */
 
 metadata {
@@ -22,6 +25,7 @@ metadata {
         capability 'Switch'
         capability 'Polling'
         capability 'PowerMeter'
+        capability 'PresenceSensor'   // NEW
 
         attribute 'DeviceName', 'string'
         attribute 'onTimeToday', 'string'           // Accumulated ON time since last daily reset (HH:MM)
@@ -40,6 +44,7 @@ metadata {
         input name: 'dailyResetTime', type: 'string', title: 'Daily ON-time reset (HH:MM, 24h)', defaultValue: '00:00', required: true
         input name: 'infoLogging', type: 'bool', title: 'Enable info logging', defaultValue: true
         input name: 'debugLogging', type: 'bool', title: 'Enable debug logging', defaultValue: false
+        input name: 'presenceTimeout', type: 'number', title: 'Presence timeout (minutes without communication → not present)', defaultValue: 15, required: true
     }
 }
 
@@ -385,7 +390,14 @@ private def updateLastCommunicationTime() {
     def formatted = formatDateTime(ts)
     sendEvent(name: 'lastCommunicationTime', value: formatted)
     displayDebugLog("lastCommunicationTime updated to ${formatted}")
+
+    // Presence: any successful communication means the device is present
+    if (device.currentValue('presence') != 'present') {
+        sendEvent(name: 'presence', value: 'present')
+        displayInfoLog("Presence updated to present (communication received)")
+    }
 }
+
 
 // Format as DD/MM/YY HH:MM
 private String formatDateTime(long ts) {
@@ -425,27 +437,47 @@ private def updateOnTimeFromStatus(String newStatus) {
     displayDebugLog("updateOnTimeFromStatus: lastStatus=${lastStatus}, newStatus=${newStatus}, accumulated=${display}")
 }
 
-// Every minute: recompute total ON time from timestamps and push the current value
+// Every minute: recompute total ON time from timestamps and push the current value,
+// and also evaluate presence from lastCommunicationTs.
 def tickOnTimer() {
     long nowTs = now()
     String lastStatus = (state.lastSwitchStatus ?: device.currentValue('switch') ?: 'off') as String
     long acc = (state.accumulatedOnMsToday ?: 0L) as long
     long lastTs = (state.lastSwitchChangeTs ?: nowTs) as long
 
-    // Start from accumulated value in state
-    long totalMs = acc
+    // --- ON-TIME DISPLAY ---
 
-    // If currently ON, add the time since the last switch-change timestamp
+    long totalMs = acc
     if (lastStatus == 'on') {
         totalMs += (nowTs - lastTs)
     }
 
-    // Just display; do NOT change accumulatedOnMsToday or lastSwitchChangeTs here
     def display = formatDurationHHMM(totalMs)
     sendEvent(name: 'onTimeToday', value: display)
     displayDebugLog("tickOnTimer: status=${lastStatus}, displayed accumulated=${display}")
-}
 
+    // --- PRESENCE EVALUATION ---
+
+    long lastComm = (state.lastCommunicationTs ?: 0L) as long
+    int timeoutMin = (presenceTimeout ?: 15) as int
+    long timeoutMs = timeoutMin * 60000L
+
+    String newPresence
+    if (lastComm == 0L) {
+        // Never communicated yet
+        newPresence = 'not present'
+    } else if ((nowTs - lastComm) <= timeoutMs) {
+        newPresence = 'present'
+    } else {
+        newPresence = 'not present'
+    }
+
+    String oldPresence = (device.currentValue('presence') ?: 'not present') as String
+    if (newPresence != oldPresence) {
+        sendEvent(name: 'presence', value: newPresence)
+        displayInfoLog("Presence updated to ${newPresence} (last comm at ${formatDateTime(lastComm)})")
+    }
+}
 
 
 // Daily reset based on user preference HH:MM
@@ -478,6 +510,11 @@ private def scheduleDailyReset() {
 // Any partial ON segment is cut at reset time as required.
 def resetDailyOnTime() {
     long nowTs = now()
+
+    // Use current attribute as the "previous" value for logging
+    String prevDisplay = (device.currentValue('onTimeToday') ?: '00:00') as String
+
+    // Also compute a precise ms value for the period up to reset, for your info log
     String lastStatus = (state.lastSwitchStatus ?: device.currentValue('switch') ?: 'off') as String
     long lastTs = (state.lastSwitchChangeTs ?: nowTs) as long
     long acc = (state.accumulatedOnMsToday ?: 0L) as long
@@ -486,14 +523,21 @@ def resetDailyOnTime() {
         acc += (nowTs - lastTs)
     }
 
-    displayInfoLog("Resetting daily ON time; previous value was ${formatDurationHHMM(acc)}")
+    // Log both: the human value and the precise recomputed one
+    displayInfoLog("Resetting daily ON time; previous value was ${prevDisplay} (computed ${formatDurationHHMM(acc)})")
 
+    // HARD RESET for the new day:
+    //  - Zero the accumulator
+    //  - Timestamp "now" as the new base
+    //  - Force logical status to OFF so ticks won't add old time
     state.accumulatedOnMsToday = 0L
     state.lastSwitchChangeTs = nowTs
-    // keep lastSwitchStatus as-is (on/off)
+    state.lastSwitchStatus = 'off'
 
+    // Visually reset the attribute
     sendEvent(name: 'onTimeToday', value: '00:00')
 }
+
 
 // ---- Logging helpers ----
 
